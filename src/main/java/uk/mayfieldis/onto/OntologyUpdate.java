@@ -1,10 +1,12 @@
-package uk.mayfieldis.fhir.onto;
+package uk.mayfieldis.onto;
 
 import ca.uhn.fhir.context.FhirContext;
 import ca.uhn.fhir.rest.api.EncodingEnum;
 
 import ca.uhn.fhir.rest.api.MethodOutcome;
 import ca.uhn.fhir.rest.client.api.IGenericClient;
+import ca.uhn.fhir.rest.param.UriParam;
+import ca.uhn.fhir.validation.ValidationOptions;
 import org.apache.commons.io.Charsets;
 import org.apache.commons.io.IOUtils;
 import org.apache.commons.lang3.StringUtils;
@@ -12,19 +14,19 @@ import org.apache.http.HttpResponse;
 import org.apache.http.client.HttpClient;
 import org.apache.http.client.methods.HttpGet;
 import org.apache.http.impl.client.HttpClientBuilder;
-import org.hl7.fhir.convertors.VersionConvertor_30_40;
 import org.hl7.fhir.dstu3.hapi.ctx.DefaultProfileValidationSupport;
 import org.hl7.fhir.dstu3.model.*;
 import org.hl7.fhir.instance.model.api.IBaseResource;
-import org.hl7.fhir.r4.model.ImplementationGuide;
-import org.hl7.fhir.r4.model.Reference;
+import org.hl7.fhir.utilities.cache.NpmPackage;
+import org.hl7.fhir.utilities.cache.PackageCacheManager;
+import org.hl7.fhir.utilities.cache.ToolsVersion;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.boot.CommandLineRunner;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.boot.autoconfigure.ldap.embedded.EmbeddedLdapProperties;
 
-import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.Reader;
@@ -46,8 +48,12 @@ public class OntologyUpdate implements CommandLineRunner {
     String igLocation = "https://hl7-uk.github.io/UK-STU3/";
     String ontoLocation ="https://ontoserver.dataproducts.nhs.uk/fhir/";
 
+    String SNOMEDVERSION = "http://snomed.info/sct/999000031000000106/version/20190320";
     private IGenericClient client;
 
+    String path = "output/";
+    PackageCacheManager pcm;
+    NpmPackage npm = null;
 
     private Map<String, CodeSystem> myCodeSystems;
     private Map<String, StructureDefinition> myStructureDefinitions;
@@ -71,13 +77,43 @@ public class OntologyUpdate implements CommandLineRunner {
         this.client.setEncoding(EncodingEnum.XML);
         try {
 
-            this.IGValidationSupport(igLocation);
-            this.fetchCore();
+            //this.IGValidationSupport(igLocation);
+            this.IGValidationSupport("hl7.uk.base","dev");
+           // this.fetchCore();
             this.UpdateOntoServer();
         } catch (Exception ex) {
             LOG.error(ex.getMessage());
         }
     }
+
+    public void IGValidationSupport(String igPackage, String igVersion) throws Exception {
+        pcm = new PackageCacheManager(true, ToolsVersion.TOOLS_VERSION);
+
+        this.myCodeSystems = new HashMap();
+        this.myValueSets = new HashMap<>();
+        this.myStructureDefinitions = new HashMap<>();
+
+        npm = pcm.loadPackage(igPackage, igVersion);
+        //    for (String resource : npm.listResources("CodeSystem", "ConceptMap", "ImplementationGuide", "StructureMap", "ValueSet", "StructureDefinition")) {
+        //        LOG.info(resource);
+        //    }
+        for (String resource : npm.listResources( "CodeSystem","ValueSet")) {
+
+            IBaseResource base = ctxSTU3.newJsonParser().parseResource(npm.load("package", resource));
+            if (base instanceof CodeSystem) {
+                CodeSystem codeSystem = (CodeSystem) base;
+                LOG.debug(codeSystem.getUrl());
+                this.myCodeSystems.put(codeSystem.getUrl(),codeSystem);
+            }
+            if (base instanceof ValueSet) {
+                ValueSet valueSet = (ValueSet) base;
+                LOG.debug(valueSet.getUrl());
+                this.myValueSets.put(valueSet.getUrl(),valueSet);
+            }
+        }
+
+    }
+
 
     public void UpdateOntoServer() throws Exception {
         for (CodeSystem codeSystem : this.myCodeSystems.values()) {
@@ -92,8 +128,53 @@ public class OntologyUpdate implements CommandLineRunner {
             if (ontoVS == null) {
                 LOG.info("Missing {}",valueSet.getUrl());
                 updateOntoValueSet(valueSet);
+            } else {
+                if (valueSet.hasCompose() && valueSet.getCompose().hasInclude()
+                && valueSet.getCompose().getIncludeFirstRep().getSystem().equals("http://snomed.info/sct")) {
+                    expandValueSet(ontoVS, valueSet);
+                }
             }
         }
+    }
+
+    public ValueSet.ValueSetExpansionComponent expandValueSet(ValueSet ontoVS, ValueSet valueSet) {
+
+        LOG.debug("Expanding {}",valueSet.getUrl());
+
+        try {
+            ValueSet.ValueSetExpansionComponent expand = null;
+
+
+            org.hl7.fhir.dstu3.model.ValueSet vsExpansion = null;
+
+
+            vsExpansion = client
+                    .operation()
+                    .onType(org.hl7.fhir.dstu3.model.ValueSet.class)
+                    .named("expand")
+                    .withSearchParameter(org.hl7.fhir.dstu3.model.Parameters.class, "identifier", new UriParam(valueSet.getUrl()))
+                    .returnResourceType(org.hl7.fhir.dstu3.model.ValueSet.class)
+                    .useHttpGet()
+                    .execute();
+
+            if (vsExpansion != null) {
+
+                LOG.debug("EXPANSION RETURNED");
+                expand = vsExpansion.getExpansion();
+                valueSet.setExpansion(expand);
+                String[] uri = valueSet.getUrl().split("/");
+                String filename= uri[uri.length-1];
+                String content = ctxSTU3.newXmlParser().setPrettyPrint(true).encodeResourceToString(valueSet);
+                LOG.debug(valueSet.getVersion());
+                Files.writeString(Paths.get(path + filename + ".xml"), content);
+                return expand;
+            }
+
+        } catch (Exception ex) {
+            LOG.error("Error in ValueSet {} NHSD Ontotology Server Returned {}",valueSet.getUrl(), ex.getMessage());
+            //LOG.error(ex.getMessage());
+        }
+        return null;
     }
 
     public void updateOntoCodeSystem(CodeSystem cs) {
