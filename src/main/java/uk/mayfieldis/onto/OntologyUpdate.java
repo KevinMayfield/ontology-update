@@ -161,6 +161,9 @@ public class OntologyUpdate implements CommandLineRunner {
 
                 LOG.debug("EXPANSION RETURNED");
                 expand = vsExpansion.getExpansion();
+                for (ValueSet.ValueSetExpansionContainsComponent containsComponent : expand.getContains()) {
+                    containsComponent.setExtension(null);
+                }
                 valueSet.setExpansion(expand);
                 String[] uri = valueSet.getUrl().split("/");
                 String filename= uri[uri.length-1];
